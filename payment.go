@@ -99,16 +99,23 @@ func (p *paidWrites) init() error {
 // advertise puts the fee and where to pay into the NIP-11 document.
 func (p *paidWrites) advertise(info *nip11.RelayInformationDocument) {
 	info.PaymentsURL = p.paymentsURL
-	info.Limitation.PaymentRequired = true
+	// Only writes are charged: reading stays free, so the relay does not
+	// require payment "before a new connection may perform any action".
+	info.Limitation.PaymentRequired = false
 	info.Limitation.RestrictedWrites = true
-	kinds := []int{}
-	for kind := range p.kinds {
-		kinds = append(kinds, kind)
+	publication := map[string]any{"amount": p.fee, "unit": "msats"}
+	// Without PAID_WRITES_KINDS every kind is charged; an empty "kinds" list
+	// would read as no kinds, so it is left out (go-nostr's fee type then
+	// serializes it as null).
+	if len(p.kinds) > 0 {
+		kinds := []int{}
+		for kind := range p.kinds {
+			kinds = append(kinds, kind)
+		}
+		slices.Sort(kinds)
+		publication["kinds"] = kinds
 	}
-	slices.Sort(kinds)
-	fee, _ := json.Marshal(map[string]any{"publication": []any{
-		map[string]any{"kinds": kinds, "amount": p.fee, "unit": "msats"},
-	}})
+	fee, _ := json.Marshal(map[string]any{"publication": []any{publication}})
 	json.Unmarshal(fee, info.Fees) // keeps admission and subscription fees, if any
 }
 
@@ -203,8 +210,17 @@ func (p *paidWrites) handlePay(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "amount must be a positive number of sats", http.StatusBadRequest)
 			return
 		}
-		res["invoice"], err = p.invoice(ctx, pubkey, sats)
-		res["amount"] = sats
+		invoice, ierr := p.invoice(ctx, pubkey, sats)
+		switch {
+		case ierr == nil:
+			res["invoice"], res["amount"] = invoice, sats
+		case res["ark_address"] != nil && res["ark_address"] != "":
+			// barkd refuses an invoice when the amount does not cover its
+			// Lightning receive fee; the Ark address can still be paid.
+			slog.Warn("paid writes: no Lightning invoice, offering Ark only", "error", ierr)
+		default:
+			err = ierr
+		}
 	}
 	if err != nil {
 		slog.Error("paid writes: barkd", "error", err)

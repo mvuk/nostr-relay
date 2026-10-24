@@ -39,6 +39,11 @@ func (m *mockBarkd) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			AmountSat int64 `json:"amount_sat"`
 		}
 		json.NewDecoder(req.Body).Decode(&body)
+		// barkd refuses an invoice that does not cover its Lightning receive fee.
+		if body.AmountSat < 10 {
+			http.Error(w, `{"message":"Failed to create invoice: Fee (0.00000100 BTC) exceeds amount"}`, http.StatusInternalServerError)
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]any{"invoice": "lntbs" + strings.Repeat("x", 400)})
 	case "GET /api/v1/history":
 		json.NewEncoder(w).Encode(m.history)
@@ -199,13 +204,16 @@ func TestPaidWritesConfig(t *testing.T) {
 	b, _ := json.Marshal(info)
 	for _, want := range []string{
 		`"payments_url":"https://relay.example.com/pay"`,
-		`"payment_required":true`,
 		`"restricted_writes":true`,
 		`"publication":[{"kinds":[1,30023],"amount":21000,"unit":"msats"}]`,
 	} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("NIP-11 document lacks %s: %s", want, b)
 		}
+	}
+	// Reads stay free, so payment is not required before any action.
+	if strings.Contains(string(b), `"payment_required":true`) {
+		t.Errorf("paid writes must not set payment_required: %s", b)
 	}
 
 	t.Setenv("PAID_WRITES_RAILS", "cashu")
@@ -222,5 +230,35 @@ func TestPayRejectsBadInput(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("/pay?%s: %d, want 400", query, rec.Code)
 		}
+	}
+}
+
+// With no PAID_WRITES_KINDS every kind is charged. An empty "kinds" list
+// would read as no kinds at all; go-nostr's fee type cannot omit the field,
+// so it is null.
+func TestAdvertiseAllKinds(t *testing.T) {
+	p, _ := newTestPaidWrites(t, nil)
+	info := nip11.RelayInformationDocument{Limitation: &nip11.RelayLimitationDocument{}, Fees: &nip11.RelayFeesDocument{}}
+	p.advertise(&info)
+	b, _ := json.Marshal(info)
+	if strings.Contains(string(b), `"kinds":[]`) {
+		t.Errorf("fee for every kind must not list kinds: %s", b)
+	}
+}
+
+// An amount below barkd's Lightning receive fee gets no invoice, but the Ark
+// address can still be paid: /pay offers that instead of failing.
+func TestPayBelowLightningFeeOffersArk(t *testing.T) {
+	p, _ := newTestPaidWrites(t, nil)
+	rec := httptest.NewRecorder()
+	p.handlePay(rec, httptest.NewRequest("GET", "/pay?pubkey="+strings.Repeat("d", 64)+"&amount=5", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/pay below the receive fee: %d %s", rec.Code, rec.Body)
+	}
+	var res map[string]any
+	json.NewDecoder(rec.Body).Decode(&res)
+	uri, _ := res["bip321"].(string)
+	if !strings.HasPrefix(uri, "bitcoin:?ark=") || strings.Contains(uri, "lightning=") {
+		t.Errorf("want an Ark-only payment request, got %q", uri)
 	}
 }
